@@ -497,8 +497,8 @@ function cleanNameQuery(raw, parsed) {
     .replace(/и\s+так\s+далее/g, ' ')
     .replace(/и\s+т\s*д/g, ' ')
     .replace(/так\s+далее/g, ' ')
-    .replace(/\b\d{1,2}\s*(?:класс|кл|класса)\b/g, ' ')
-    .replace(/\b(?:для|в)\s*\d{1,2}\s*(?:класс|кл|класса)\b/g, ' ');
+    .replace(/(?<!\d)\d{1,2}\s*(?:класс|кл|класса)(?![\dа-яёa-z])/giu, ' ')
+    .replace(/(?:для|в)\s*\d{1,2}\s*(?:класс|кл|класса)(?![\dа-яёa-z])/giu, ' ');
 
   // Remove request/action words, keep only likely name words.
   const tokens = s.split(/\s+/).filter(Boolean);
@@ -644,7 +644,7 @@ function deriveFacts(title, text) {
   const facts = { birth: '', death: '', born: '', country: '', job: '', education: '', career: '', raised: '', family: {} };
   const b = text.match(/(?:родился|родилась)[^.]{0,120}?(\d{4})/i);
   if (b) facts.birth = b[1];
-  const bornPlace = text.match(/(?:родился|родилась)[^.]{0,120}?\bв\s+([^,.]{2,60})/i);
+  const bornPlace = text.match(/(?:родился|родилась)[^.]{0,120}?[\s(,]в\s+([^,.]{2,60})/iu);
   if (bornPlace) facts.born = bornPlace[1].trim();
   const country = text.match(/(гражданство|государство|страна)[^:]{0,40}:\s*([^.\n]{2,50})/i);
   if (country) facts.country = country[2].trim();
@@ -1044,8 +1044,8 @@ async function handlePresRequest(ctx, s, raw) {
   const parsed = parseRequest(raw, 'pres');
   s.storedParsed = parsed;
 
-  const nums = String(raw).match(/\b(\d{1,2})\s*(?:слайд|слайдов|слайда|лист|листов)\b/i) ||
-    String(raw).match(/\b(\d{1,2})\s*[.)]?\s*$/);
+  const nums = String(raw).match(/(?<!\d)(\d{1,2})\s*(?:слайд|слайдов|слайда|лист|листов)(?![\dа-яёa-z])/iu) ||
+    String(raw).match(/(?<!\d)(\d{1,2})\s*[.)]?\s*$/u);
   s.slideCount = nums ? Math.max(3, Math.min(16, Number(nums[1]))) : 0;
 
   if (!s.slideCount) {
