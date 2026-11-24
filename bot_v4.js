@@ -22,6 +22,7 @@ const BOT_VERSION = '2026-11-24-v5';
 
 const WIKI_API = 'https://ru.wikipedia.org/w/api.php';
 const WIKI_FALLBACK = 'https://ru.m.wikipedia.org/w/api.php';
+const WIKI_EN_API = 'https://en.wikipedia.org/w/api.php';
 const WIKIDATA_API = 'https://www.wikidata.org/w/api.php';
 const SPARQL_API = 'https://query.wikidata.org/sparql';
 const NOMINATIM_API = 'https://nominatim.openstreetmap.org/search';
@@ -857,14 +858,15 @@ async function collectSubject(rawQuery, parsed) {
   const msLeft = () => Math.max(1000, deadline - Date.now());
   let hit = null;
   let source = '';
+  let lastWikiError = null;
 
-  for (const base of [WIKI_API, WIKI_FALLBACK]) {
+  for (const base of [WIKI_API, WIKI_FALLBACK, WIKI_EN_API]) {
     if (Date.now() > deadline) break;
     try {
       const titles = await withTimeout(wikiSearch(base, topic), Math.min(9000, msLeft()), 'wiki search');
       for (const title of titles.slice(0, 4)) {
         if (Date.now() > deadline) break;
-        if (/список|категория|шаблон|портал/i.test(title)) continue;
+        if (/список|категория|шаблон|портал|list of/i.test(title)) continue;
         const page = await withTimeout(wikiExtract(base, title), Math.min(9000, msLeft()), 'wiki extract');
         if (page.text && page.text.length > 80) {
           hit = { ...page, source: 'Википедия' };
@@ -872,7 +874,10 @@ async function collectSubject(rawQuery, parsed) {
           break;
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      lastWikiError = e;
+      console.error('wiki error', base, e && e.message, e && e.response && e.response.status);
+    }
     if (hit) break;
   }
 
@@ -884,7 +889,10 @@ async function collectSubject(rawQuery, parsed) {
     }
   }
 
-  if (!hit) return null;
+  if (!hit) {
+    console.error('no subject hit', JSON.stringify({ topic, wikiError: lastWikiError && lastWikiError.message }));
+    return null;
+  }
 
   const wantsPlace = !!(parsed && parsed.wantMap);
   let kind = 'topic';
