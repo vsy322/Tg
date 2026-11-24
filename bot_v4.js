@@ -23,6 +23,7 @@ const BOT_VERSION = '2026-11-24-v5';
 const WIKI_API = 'https://ru.wikipedia.org/w/api.php';
 const WIKI_FALLBACK = 'https://ru.m.wikipedia.org/w/api.php';
 const WIKI_EN_API = 'https://en.wikipedia.org/w/api.php';
+const WIKIMEDIA_API = 'https://api.wikimedia.org/core/v1/wikipedia/ru';
 const WIKIDATA_API = 'https://www.wikidata.org/w/api.php';
 const SPARQL_API = 'https://query.wikidata.org/sparql';
 const NOMINATIM_API = 'https://nominatim.openstreetmap.org/search';
@@ -682,6 +683,53 @@ async function wikiExtract(base, title) {
   };
 }
 
+// api.wikimedia.org is a separate host from *.wikipedia.org and is not
+// affected by the shared-IP 429 rate limits seen on Render.
+function cleanWikitext(src) {
+  let t = String(src || '');
+  t = t.replace(/^\[\[(?:Файл|Image|Изображение):[^\n]*$/gim, ' ')
+    .replace(/^\[\[(?:File):[^\n]*$/gim, ' ')
+    .replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, ' ')
+    .replace(/<ref[^>]*\/>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<math[^>]*>[\s\S]*?<\/math>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ');
+  for (let i = 0; i < 5; i++) t = t.replace(/\{\{[^{}]*\}\}/g, ' ');
+  t = t.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
+    .replace(/\[\[([^\]]+)\]\]/g, (m, p) => String(p).split('/').pop())
+    .replace(/\[https?:\/\/\S+\s+([^\]]+)\]/g, '$1')
+    .replace(/\[https?:\/\/\S+\]/g, ' ')
+    .replace(/'''''|'''|''/g, '')
+    .replace(/\(\s*\)/g, '')
+    .replace(/^={2,}.*?={2,}\s*$/gm, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return t.slice(0, 12000);
+}
+
+async function wikimediaSearch(name) {
+  const data = await apiGet(`${WIKIMEDIA_API}/search/page`, { q: name, limit: 6 });
+  return (data.pages || []).map(p => ({
+    key: p.key || p.title,
+    title: p.title || String(p.key || '').replace(/_/g, ' '),
+    blurb: String(p.excerpt || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
+    description: p.description || ''
+  }));
+}
+
+async function wikimediaExtract(page) {
+  const key = page.key || page.title;
+  const data = await apiGet(`${WIKIMEDIA_API}/page/${encodeURIComponent(key)}`);
+  const text = cleanWikitext(data.source || '');
+  return {
+    title: data.title || page.title,
+    text: text || `${page.description || ''} ${page.blurb || ''}`.trim(),
+    description: page.description || '',
+    wikidata: ''
+  };
+}
+
 async function wikidataLabel(qid) {
   if (!qid) return '';
   try {
@@ -860,23 +908,39 @@ async function collectSubject(rawQuery, parsed) {
   let source = '';
   let lastWikiError = null;
 
-  for (const base of [WIKI_API, WIKI_FALLBACK, WIKI_EN_API]) {
+  for (const backend of ['wikimedia', 'wikipedia', 'wikipedia-mobile', 'wikipedia-en']) {
     if (Date.now() > deadline) break;
     try {
-      const titles = await withTimeout(wikiSearch(base, topic), Math.min(9000, msLeft()), 'wiki search');
-      for (const title of titles.slice(0, 4)) {
-        if (Date.now() > deadline) break;
-        if (/список|категория|шаблон|портал|list of/i.test(title)) continue;
-        const page = await withTimeout(wikiExtract(base, title), Math.min(9000, msLeft()), 'wiki extract');
-        if (page.text && page.text.length > 80) {
-          hit = { ...page, source: 'Википедия' };
-          source = 'Википедия';
-          break;
+      if (backend === 'wikimedia') {
+        const pages = await withTimeout(wikimediaSearch(topic), Math.min(9000, msLeft()), 'wikimedia search');
+        for (const page of pages.slice(0, 4)) {
+          if (Date.now() > deadline) break;
+          if (/список|категория|шаблон|портал|list of/i.test(page.title)) continue;
+          const extracted = await withTimeout(wikimediaExtract(page), Math.min(9000, msLeft()), 'wikimedia extract');
+          if (extracted.text && extracted.text.length > 80) {
+            hit = { ...extracted, source: 'Википедия' };
+            source = 'Википедия';
+            break;
+          }
+        }
+      } else {
+        const base = backend === 'wikipedia' ? WIKI_API
+          : backend === 'wikipedia-mobile' ? WIKI_FALLBACK : WIKI_EN_API;
+        const titles = await withTimeout(wikiSearch(base, topic), Math.min(9000, msLeft()), 'wiki search');
+        for (const title of titles.slice(0, 4)) {
+          if (Date.now() > deadline) break;
+          if (/список|категория|шаблон|портал|list of/i.test(title)) continue;
+          const page = await withTimeout(wikiExtract(base, title), Math.min(9000, msLeft()), 'wiki extract');
+          if (page.text && page.text.length > 80) {
+            hit = { ...page, source: 'Википедия' };
+            source = 'Википедия';
+            break;
+          }
         }
       }
     } catch (e) {
       lastWikiError = e;
-      console.error('wiki error', base, e && e.message, e && e.response && e.response.status);
+      console.error('wiki error', backend, e && e.message, e && e.response && e.response.status);
     }
     if (hit) break;
   }
@@ -900,6 +964,7 @@ async function collectSubject(rawQuery, parsed) {
   else if (looksPerson(hit.text, hit.title)) kind = 'person';
   else if (looksPlace(topic)) kind = 'place';
   const facts = kind === 'person' ? deriveFacts(hit.title, hit.text) : deriveEntityFacts(hit.title, hit.text);
+  if (kind === 'topic' && hit.description) facts.type = hit.description;
   let geo = null;
   if ((kind === 'place' || wantsPlace || looksPlace(topic)) && Date.now() < deadline) {
     geo = await withTimeout(geocodePlace(topic), Math.min(7000, msLeft()), 'map').catch(() => null);
@@ -1584,8 +1649,11 @@ if (require.main === module) {
     process.exit(1);
   });
 
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  const stopBot = signal => {
+    try { bot.stop(signal); } catch (_) { /* already stopped in webhook mode */ }
+  };
+  process.once('SIGINT', () => stopBot('SIGINT'));
+  process.once('SIGTERM', () => stopBot('SIGTERM'));
 }
 
 module.exports = {
