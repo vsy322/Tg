@@ -18,12 +18,13 @@ const USE_PROXY = !!process.env.USE_PROXY;
 const PROXY_URL = process.env.PROXY_URL || 'socks://127.0.0.1:10808';
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
-const BOT_VERSION = '2026-11-21-v4';
+const BOT_VERSION = '2026-11-24-v5';
 
 const WIKI_API = 'https://ru.wikipedia.org/w/api.php';
 const WIKI_FALLBACK = 'https://ru.m.wikipedia.org/w/api.php';
 const WIKIDATA_API = 'https://www.wikidata.org/w/api.php';
 const SPARQL_API = 'https://query.wikidata.org/sparql';
+const NOMINATIM_API = 'https://nominatim.openstreetmap.org/search';
 const MAX_SEARCH_MS = 29000;
 const MAX_REQUEST_MS = 9000;
 
@@ -309,6 +310,33 @@ const LOCAL_PEOPLE = [
   }
 ];
 
+// Public places/organizations with manually checked open data.
+const LOCAL_PLACES = [
+  {
+    title: 'МОУ Раменская СОШ № 35 «Вектор успеха»',
+    aliases: [
+      'школа 35 раменский район', 'школа 35 в раменском районе',
+      'школа 35 в раменском раёне', 'школа 35 в раменсокм раёне',
+      'школа 35 раменсокм районе', 'школа 35 раменское',
+      'школа numero 35 раменское', 'сош 35 раменское',
+      'рамсош 35', '35 школа раменское', 'школа 35 вектор успеха'
+    ],
+    facts: {
+      founded: '22 июня 2021 года',
+      type: 'муниципальная общеобразовательная организация',
+      director: 'Витчинов Николай Сергеевич',
+      address: '140103, Московская область, г. Раменское, ул. Молодежная, д. 19',
+      phone: '+7 (496) 475-84-30',
+      email: 'ram_school35@mosreg.ru',
+      buildings: 'ул. Молодежная, д. 19; ул. Молодежная, д. 26В; ул. Молодежная, зд. 28, к. д; ул. Молодежная, д. 17',
+      founder: 'Администрация Раменского муниципального района Московской области'
+    },
+    text: 'Школа создана 22 июня 2021 года. 13 сентября 2021 года считается Днём рождения школы: в этот день был подписан акт о готовности к первому учебному году. В школе важны не только обучение, но и развитие личности, раскрытие талантов и уверенность в своих силах. Учащиеся становятся призёрами олимпиад муниципального и регионального уровней, среди выпускников есть золотые и серебряные медалисты. Работают математические, инженерные, медицинские, предпринимательские и психолого-педагогические классы, цифровые классы Подмосковья, школьный хор «Созвучие», театры, Волонтёрское движение и Юнармия.',
+    geo: { lat: 55.5937183, lon: 38.2512749, place: 'Раменское, ул. Молодежная, д. 19' },
+    source: 'официальный сайт ramsch35.edumsko.ru (Основные сведения, Летопись) + OpenStreetMap'
+  }
+];
+
 const ALIASES = {};
 for (const p of LOCAL_PEOPLE) {
   ALIASES[norm(p.name)] = p.name;
@@ -365,6 +393,12 @@ function dot(s) {
 function cap(s) {
   const v = String(s || '').trim();
   return v ? v[0].toUpperCase() + v.slice(1) : v;
+}
+
+function foundedPhrase(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  return dot(/год/i.test(s) ? s : `${s} год`);
 }
 
 function norm(s) {
@@ -461,6 +495,8 @@ function parseRequest(raw, mode) {
   const raisedSoft = /мам|пап|сем(?:ью|ьи|и|я)/.test(lower) && !noFamily;
   const onlyRaised = raisedExplicit || raisedSoft;
   const grade = (original.match(/(?:^|\s)(\d{1,2})\s*(?:класс|кл|класса)(?:\s|$)/i) || [])[1] || '';
+  const isQuestion = /\?/.test(original) || /^(?:что|кто|где|когда|почему|зачем|как|сколько|какой|какая|какие|чем|чья|чьё)/i.test(original.trim());
+  const wantMap = /где\s+находится|адрес|карт|локац|координат|на\s+карте|местополож|найди\s+место|расположен/i.test(lower);
 
   add(noFamily, 'Без раздела «Семья»');
   add(noWar, 'Без раздела войны и боевых действий');
@@ -468,7 +504,7 @@ function parseRequest(raw, mode) {
   add(onlySchool, 'Особое внимание: где учился и на кого пошёл');
   add(onlyRaised, 'Особое внимание: кто воспитывал и детство');
 
-  return { original, lower, constraints, grade, noFamily, noWar, noPolitics, onlySchool, onlyRaised, mode };
+  return { original, lower, constraints, grade, noFamily, noWar, noPolitics, onlySchool, onlyRaised, isQuestion, wantMap, mode };
 }
 
 function cleanNameQuery(raw, parsed) {
@@ -515,6 +551,19 @@ function cleanNameQuery(raw, parsed) {
   return kept.join(' ').trim();
 }
 
+// Keep nouns (school, museum, address...) for general questions.
+function extractTopic(raw) {
+  let s = norm(raw)
+    .replace(/^(\/start|📝\s*готовый\s*текст|📊\s*презентация)\s*/i, '')
+    .replace(/[?？!]+/g, ' ')
+    .replace(/презентац[иия]|презент|слайд[аов]?/gi, ' ')
+    .replace(/(?<![\dа-яёa-z])(?:расскажи|написать|напиши|сделай|сгенерируй|создай|информация|инфу|инфо|сведения|данные|даные|доклад|реферат|сочинение|текст|работу|работы|мне|нужно|надо|хочу|пожалуйста|пжлст|пж|давай|дай|пиши|найди|найти|поищи|проверь|сверь|про|обо|об|о|источники|источник|Википедия|Вики)(?![\dа-яёa-z])/giu, ' ')
+    .replace(/(?<![\dа-яёa-z])(?:что|кто|где|когда|почему|зачем|как|сколько|какой|какая|какие|чем|чья|чьё|это|такое|такой)(?![\dа-яёa-z])/giu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return s;
+}
+
 function findLocal(query) {
   const q = norm(query);
   if (!q) return null;
@@ -546,6 +595,27 @@ function findLocal(query) {
 
   // Require confident match; otherwise let online sources try.
   return bestScore >= 0.67 ? best : null;
+}
+
+function findLocalPlace(raw) {
+  const q = norm(raw);
+  if (!q) return null;
+  const qTokens = q.split(/\s+/).filter(Boolean);
+  let best = null;
+  let bestScore = 0;
+  for (const place of LOCAL_PLACES) {
+    const variants = [place.title, ...place.aliases].map(norm);
+    let score = 0;
+    for (const v of variants) {
+      const vt = v.split(/\s+/).filter(Boolean);
+      score = Math.max(score, bestNameScore(vt, qTokens));
+      if (v === q || q.includes(v) || v.includes(q)) score = Math.max(score, 0.95);
+    }
+    // Require a district/city signal for generic "школа 35" queries.
+    if (!/рамен|ramen/.test(q) && !/рамен|ramen/.test(place.title)) score *= 0.5;
+    if (score > bestScore) { bestScore = score; best = place; }
+  }
+  return bestScore >= 0.62 ? best : null;
 }
 
 // ============================ SOURCES ============================
@@ -629,6 +699,44 @@ async function ddgSearch(name) {
     const text = [data.AbstractText, data.Answer].filter(Boolean).join('\n');
     return { title: data.Heading || name, text: text.trim() };
   } catch (_) { return null; }
+}
+
+async function geocodePlace(query) {
+  try {
+    const data = await apiGet(NOMINATIM_API, {
+      q: query, format: 'jsonv2', addressdetails: 1, limit: 1
+    }, { timeout: 7000 });
+    const hit = Array.isArray(data) && data[0];
+    if (!hit) return null;
+    const lat = Number(hit.lat);
+    const lon = Number(hit.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    return {
+      lat,
+      lon,
+      place: hit.display_name || '',
+      type: hit.type || '',
+      osm: hit.osm_type && hit.osm_id ? `https://www.openstreetmap.org/${hit.osm_type}/${hit.osm_id}` : ''
+    };
+  } catch (_) { return null; }
+}
+
+function looksPlace(query) {
+  return /школ|лицей|гимназ|институт|университет|академи|музей|парк|площад|улиц|проспект|город|село|деревн|район|област|вокзал|аэропорт|стадион|театр|библиотек|больниц|храм|собор|монастыр|дворец|завод|фабрик|организац|адрес|место|здание/i.test(String(query || ''));
+}
+
+function deriveEntityFacts(title, text) {
+  const facts = { founded: '', type: '', director: '', address: '', buildings: '', rating: '' };
+  const founded = text.match(/(?:основан|основана|открыт|открыта|создан|создана|образован|образована|построен|построена)[^.]{0,100}?(\d{4})/i) ||
+    text.match(/(\d{4})\s*год[уа]?\s*(?:был[аи]?\s*)?(?:открыт|основан|создан)/i);
+  if (founded) facts.founded = founded[1];
+  const director = text.match(/(?:директор|руководитель|глава|председатель)[^\n.]{0,100}/i);
+  if (director) facts.director = director[0].trim();
+  const address = text.match(/(?:адрес|расположен[аы]?)[^:]{0,40}:\s*([^.\n]{5,140})/i);
+  if (address) facts.address = address[1].trim();
+  const type = text.match(/^(.{3,120}?)(?:—|\-|это|является)/);
+  if (type) facts.type = type[1].trim();
+  return facts;
 }
 
 function looksPerson(text, title) {
@@ -721,31 +829,116 @@ async function collectPerson(rawQuery, parsed) {
   };
 }
 
+// Broad search: returns a person, organization or place from open sources.
+async function collectSubject(rawQuery, parsed) {
+  const q = cleanNameQuery(rawQuery, parsed);
+  const localPerson = findLocal(q);
+  if (localPerson) {
+    return { ...localPerson, title: localPerson.name, kind: 'person', source: 'проверенная локальная база' };
+  }
+
+  const localPlace = findLocalPlace(rawQuery);
+  if (localPlace) {
+    const geo = localPlace.geo || await geocodePlace(localPlace.title).catch(() => null);
+    return { ...localPlace, title: localPlace.title, kind: 'place', geo, source: localPlace.source };
+  }
+
+  const topic = extractTopic(rawQuery) || q;
+  if (!topic) return null;
+
+  const deadline = Date.now() + MAX_SEARCH_MS;
+  const msLeft = () => Math.max(1000, deadline - Date.now());
+  let hit = null;
+  let source = '';
+
+  for (const base of [WIKI_API, WIKI_FALLBACK]) {
+    if (Date.now() > deadline) break;
+    try {
+      const titles = await withTimeout(wikiSearch(base, topic), Math.min(9000, msLeft()), 'wiki search');
+      for (const title of titles.slice(0, 4)) {
+        if (Date.now() > deadline) break;
+        if (/список|категория|шаблон|портал/i.test(title)) continue;
+        const page = await withTimeout(wikiExtract(base, title), Math.min(9000, msLeft()), 'wiki extract');
+        if (page.text && page.text.length > 80) {
+          hit = { ...page, source: 'Википедия' };
+          source = 'Википедия';
+          break;
+        }
+      }
+    } catch (_) {}
+    if (hit) break;
+  }
+
+  if (!hit && Date.now() < deadline) {
+    const ddg = await withTimeout(ddgSearch(topic), Math.min(8000, msLeft()), 'ddg').catch(() => null);
+    if (ddg && ddg.text) {
+      hit = { title: ddg.title || topic, text: ddg.text, source: 'DuckDuckGo' };
+      source = 'DuckDuckGo';
+    }
+  }
+
+  if (!hit) return null;
+
+  let kind = 'topic';
+  if (looksPerson(hit.text, hit.title)) kind = 'person';
+  else if (looksPlace(topic)) kind = 'place';
+  const facts = kind === 'person' ? deriveFacts(hit.title, hit.text) : deriveEntityFacts(hit.title, hit.text);
+  let geo = null;
+  if ((kind === 'place' || parsed.wantMap || looksPlace(topic)) && Date.now() < deadline) {
+    geo = await withTimeout(geocodePlace(topic), Math.min(7000, msLeft()), 'map').catch(() => null);
+  }
+
+  return {
+    name: hit.title,
+    title: hit.title,
+    kind,
+    text: hit.text,
+    facts,
+    geo,
+    source: source + (geo ? ' + OpenStreetMap' : '')
+  };
+}
+
 // ============================ REPORT ============================
 
 function makeReport(d, note, parsed) {
+  if (d && d.kind === 'place') return makePlaceReport(d, note, parsed);
+  if (d && d.kind === 'topic') return makeTopicReport(d, note, parsed);
+  return makePersonReport(d, note, parsed);
+}
+
+function makePersonReport(d, note, parsed) {
   const f = d.facts || {};
   const lines = [];
-  lines.push(`Доклад на тему: ${d.title}`, '');
-  lines.push('Введение');
-  lines.push(`${d.title} — известная личность. ${f.birth ? 'Родился(ась) в ' + f.birth + ' году' : 'Информация о годе рождения приведена в открытых источниках'}${f.born ? ' в ' + f.born : ''}. ${f.country ? 'Гражданство: ' + f.country + '. ' : ''}${f.job ? 'Род деятельности: ' + dot(f.job) : ''}`);
-  lines.push('', 'Основная часть');
-  let ss = sentences(d.text || '', 8);
+  lines.push(`Доклад на тему: ${d.title}`, 'OSINT-профиль личности (только открытые данные)', '');
+
+  lines.push('Краткий портрет');
+  lines.push(`${d.title} — ${f.job || 'известная личность'}. ${f.birth ? 'Родился(ась) в ' + f.birth + ' году' : 'Год рождения указан в открытых источниках'}${f.born ? ' в ' + f.born : ''}. ${f.country ? 'Гражданство: ' + f.country + '.' : ''}`.replace(/\s+/g, ' ').trim());
+
+  let ss = sentences(d.text || '', 10);
   if (parsed && parsed.noWar) ss = ss.filter(s => !/войн|боев|военн/i.test(s));
   if (parsed && parsed.noPolitics) ss = ss.filter(s => !/полит|парти|президент|правительств/i.test(s));
-  if (ss.length) for (const s of ss) lines.push(s);
-  else lines.push('В открытых источниках приведены основные сведения о жизни и деятельности этой личности.');
+  const chronology = ss.filter(s => /\d{4}\s*год|в\s+\d{4}/i.test(s));
+  const other = ss.filter(s => !chronology.includes(s));
 
-  if (f.education || f.career || (parsed && parsed.onlySchool)) {
-    lines.push('', 'Образование и путь');
-    if (f.education) lines.push('Образование: ' + dot(String(f.education).replace(/^.*?(учился|училась|окончил|окончила|образование)\s*/i, '')));
-    if (f.career) lines.push('Деятельность: ' + dot(String(f.career).replace(/^.*?(деятельность|работал|работала|занимался|занималась)\s*/i, '')));
-    if (!f.education && !f.career) lines.push('Подробные сведения об образовании и карьере приведены в открытых источниках.');
+  lines.push('', 'Хронология');
+  lines.push(...(chronology.length ? chronology.slice(0, 6) : ['Основные даты биографии приведены в открытых источниках.']));
+
+  lines.push('', 'Основная часть');
+  lines.push(...(other.length ? other.slice(0, 5) : ['В открытых источниках приведены основные сведения о жизни и деятельности этой личности.']));
+
+  if (f.education || parsed.onlySchool) {
+    lines.push('', 'Образование');
+    lines.push(f.education ? dot(String(f.education).replace(/^.*?(учился|училась|окончил|окончила|образование)\s*/i, '')) : 'Сведения об образовании приведены в открытых источниках.');
+  }
+  if (f.career || parsed.onlySchool) {
+    lines.push('', 'Карьера и деятельность');
+    lines.push(f.career ? dot(String(f.career).replace(/^.*?(деятельность|работал|работала|занимался|занималась)\s*/i, '')) : 'Основные этапы деятельности приведены в открытых источниках.');
   }
 
-  if (parsed && parsed.onlyRaised) {
-    lines.push('', 'Воспитание');
-    lines.push(f.raised ? dot(cap(f.raised)) : 'Сведения о воспитании приведены в открытых источниках.');
+  if (!(parsed && parsed.noFamily) && (parsed && (parsed.onlyRaised || !parsed.onlySchool))) {
+    lines.push('', 'Происхождение и воспитание');
+    lines.push(f.raised ? dot(cap(f.raised)) : 'Сведения о детстве и воспитании приведены в открытых источниках.');
     const parents = Object.entries(f.family || {}).filter(([k]) => /отец|мать|родител/i.test(k));
     for (const [k, v] of parents) lines.push(`${k}: ${v.join(', ')}.`);
   }
@@ -756,15 +949,99 @@ function makeReport(d, note, parsed) {
     for (const [k, v] of fam) lines.push(`${k}: ${v.join(', ')}.`);
   }
 
-  lines.push('', 'Заключение');
-  lines.push(`${d.title} оставил(а) заметный след. Его/её биография изучается в школе и может быть использована для самостоятельной работы.`);
+  lines.push('', 'Значение и наследие');
+  lines.push(`${d.title} оставил(а) заметный след. Биография подходит для школьного доклада и самостоятельной работы.`);
+  lines.push('', 'Источники');
+  lines.push(dot(d.source || 'открытые источники'));
 
-  let text = lines.join('\n');
-  text = text.replace(/[ \t]+/g, ' ')
+  return cleanupReport(lines);
+}
+
+function makeTopicReport(d, note, parsed) {
+  const lines = [];
+  const ss = sentences(d.text || '', 8);
+  lines.push(`Тема: ${d.title}`, parsed && parsed.isQuestion ? 'Ответ на вопрос (открытые источники)' : 'Краткая справка (открытые источники)', '');
+
+  lines.push('Коротко');
+  lines.push(ss.length ? ss[0] : `${d.title} — сведения приведены в открытых источниках.`);
+
+  if (ss.length > 1) {
+    lines.push('', 'Подробнее');
+    lines.push(...ss.slice(1, 6));
+  }
+
+  const f = d.facts || {};
+  if (f.type) {
+    lines.push('', 'Классификация');
+    lines.push(dot(f.type));
+  }
+  if (f.founded) {
+    lines.push('', 'Дата');
+    lines.push(foundedPhrase(f.founded));
+  }
+  if (d.geo) {
+    lines.push('', 'На карте');
+    lines.push(`Место: ${d.geo.place}.`);
+    lines.push(`Координаты: ${d.geo.lat.toFixed(6)}, ${d.geo.lon.toFixed(6)}.`);
+    lines.push(`Карта: https://yandex.ru/maps/?pt=${d.geo.lon},${d.geo.lat}&z=16&l=map`);
+  }
+
+  lines.push('', 'Источники');
+  lines.push(dot(d.source || 'открытые источники'));
+  lines.push('', 'Если вопрос звучал иначе, уточни его и я попробую найти более точный ответ.');
+  return cleanupReport(lines);
+}
+
+function makePlaceReport(d, note, parsed) {
+  const f = d.facts || {};
+  const lines = [];
+  lines.push(`Доклад на тему: ${d.title}`, 'Сводка по открытым данным', '');
+
+  lines.push('Что это');
+  lines.push(`${d.title}${f.type ? ' — ' + f.type : ''}.`.replace(/\s+/g, ' ').trim());
+
+  lines.push('', 'История и дата основания');
+  lines.push(f.founded ? `Дата основания/открытия: ${foundedPhrase(f.founded)}` : 'Дата основания приведена в открытых источниках.');
+  if (f.founder) lines.push(`Учредитель: ${dot(f.founder)}`);
+  const history = sentences(d.text || '', 5);
+  lines.push(...(history.length ? history : ['Исторические сведения приведены в открытых источниках.']));
+
+  if (f.director) {
+    lines.push('', 'Руководство');
+    lines.push(`Директор (руководитель): ${f.director}.`);
+  }
+  if (f.rating) {
+    lines.push('', 'Деятельность и показатели');
+    lines.push(dot(f.rating));
+  }
+
+  lines.push('', 'Где находится');
+  if (d.geo) {
+    lines.push(`Адрес/место: ${d.geo.place || f.address || 'указано на карте'}.`);
+    lines.push(`Координаты: ${d.geo.lat.toFixed(6)}, ${d.geo.lon.toFixed(6)}.`);
+    lines.push(`Карта: https://yandex.ru/maps/?pt=${d.geo.lon},${d.geo.lat}&z=16&l=map`);
+    if (d.geo.osm) lines.push(`OpenStreetMap: ${d.geo.osm}`);
+  } else if (f.address) {
+    lines.push(`Адрес: ${f.address}.`);
+  } else {
+    lines.push('Точный адрес уточняется по карте.');
+  }
+  if (f.buildings) lines.push(`Здания: ${f.buildings}.`);
+  if (f.phone) lines.push(`Телефон: ${f.phone}.`);
+  if (f.email) lines.push(`E-mail: ${f.email}.`);
+
+  lines.push('', 'Источники');
+  lines.push(dot(d.source || 'открытые источники'));
+
+  return cleanupReport(lines);
+}
+
+function cleanupReport(lines) {
+  return lines.join('\n')
+    .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .replace(/\s+([.,;:])/g, '$1')
     .trim();
-  return text;
 }
 
 function sentences(text, limit = 6) {
@@ -777,17 +1054,30 @@ function sentences(text, limit = 6) {
 
 // ============================ PRESENTATION ============================
 
-const THEMES = [
-  { name: 'синий', bg: 'F2F6FF', dark: '1E3A8A', accent: '3B82F6', light: 'DBEAFE' },
-  { name: 'зелёный', bg: 'F1F8F2', dark: '1B5E20', accent: '43A047', light: 'DCEDC8' },
-  { name: 'фиолетовый', bg: 'F7F3FF', dark: '4A148C', accent: '7B1FA2', light: 'E1BEE7' },
-  { name: 'granat', bg: 'F4F6FA', dark: '0F2A5A', accent: '2E5CA8', light: 'D6E4FF' },
-  { name: 'тёплый', bg: 'FFF8EE', dark: '8A3B12', accent: 'D97706', light: 'FFE0B2' }
-];
+const DESIGNS = {
+  school: {
+    label: '🏫 Школьный',
+    bg: 'F2F6FF', dark: '1E3A8A', accent: '3B82F6', light: 'DBEAFE',
+    titleBg: '1E3A8A', titleText: 'FFFFFF', body: '1F2937'
+  },
+  modern: {
+    label: '🚀 Современный',
+    bg: '0F172A', dark: 'E2E8F0', accent: '38BDF8', light: '1E293B',
+    titleBg: '020617', titleText: 'F8FAFC', body: 'E2E8F0'
+  },
+  bright: {
+    label: '🌞 Яркий',
+    bg: 'FFF8EE', dark: '8A3B12', accent: 'D97706', light: 'FFE0B2',
+    titleBg: '8A3B12', titleText: 'FFFFFF', body: '1F2937'
+  }
+};
+const DESIGN_LABELS = Object.fromEntries(Object.entries(DESIGNS).map(([k, v]) => [k, v.label]));
 
-function pickTheme(title) {
+function pickTheme(title, design) {
+  if (design && DESIGNS[design]) return DESIGNS[design];
+  const keys = Object.keys(DESIGNS);
   const h = [...norm(title)].reduce((a, c) => a + c.charCodeAt(0), 0);
-  return THEMES[h % THEMES.length];
+  return DESIGNS[keys[h % keys.length]];
 }
 
 function splitBullets(text, max = 5) {
@@ -804,8 +1094,10 @@ function splitBullets(text, max = 5) {
 
 function buildSlidePlan(d, slideCount, parsed) {
   const n = Math.max(3, Math.min(16, Number(slideCount) || 7));
-  const theme = pickTheme(d.title);
   const f = d.facts || {};
+
+  if (d && d.kind === 'place') return buildPlaceSlidePlan(d, n, parsed);
+  if (d && d.kind === 'topic') return buildTopicSlidePlan(d, n, parsed);
 
   const plan = [];
   plan.push({
@@ -910,7 +1202,53 @@ function buildSlidePlan(d, slideCount, parsed) {
   return plan;
 }
 
-async function makePptx(d, slideCount, parsed) {
+function buildTopicSlidePlan(d, n, parsed) {
+  const ss = splitBullets(d.text || '', 6);
+  const plan = [];
+  plan.push({ kind: 'title', title: d.title, subtitle: 'Ответ по открытым источникам', badge: `${parsed.grade ? parsed.grade + ' класс' : 'Школьный проект'}` });
+  plan.push({ kind: 'bullets', title: 'Коротко', bullets: [ss[0] || `${d.title} — тема из открытых источников.`, 'Сведения можно проверить по указанным источникам.'] });
+  for (let i = 1; i < ss.length && plan.length < n - 2; i += 3) {
+    plan.push({ kind: 'bullets', title: 'Подробнее', bullets: ss.slice(i, i + 3) });
+  }
+  if (d.geo) {
+    plan.push({ kind: 'bullets', title: 'На карте', bullets: [d.geo.place, `Координаты: ${d.geo.lat.toFixed(6)}, ${d.geo.lon.toFixed(6)}.`, 'Точка на карте отправлена отдельным сообщением.'].filter(Boolean) });
+  }
+  plan.push({ kind: 'bullets', title: 'Источники', bullets: [dot(d.source || 'открытые источники')] });
+  plan.push({ kind: 'final', title: 'Вывод', bullets: [`${d.title} — тема, по которой собраны открытые сведения.`, 'При необходимости запрос можно уточнить.'] });
+
+  while (plan.length < n) {
+    plan.splice(Math.max(3, plan.length - 1), 0, { kind: 'bullets', title: 'Дополнительно', bullets: [ss[plan.length % Math.max(1, ss.length)] || 'Дополнительные сведения приведены в открытых источниках.'] });
+  }
+  return plan.slice(0, n);
+}
+
+function buildPlaceSlidePlan(d, n, parsed) {
+  const f = d.facts || {};
+  const plan = [];
+  plan.push({ kind: 'title', title: d.title, subtitle: 'Доклад / презентация', badge: `${parsed.grade ? parsed.grade + ' класс' : 'Школьный проект'}` });
+  plan.push({ kind: 'bullets', title: 'Что это', bullets: [d.title, f.type ? `Тип: ${f.type}.` : '', 'Сведения собраны из открытых источников.'].filter(Boolean) });
+  plan.push({ kind: 'bullets', title: 'История', bullets: splitBullets(d.text || '', 4) });
+  if (f.founded) plan.push({ kind: 'bullets', title: 'Дата основания', bullets: [`Основана/открыта: ${foundedPhrase(f.founded)}`, f.founder ? `Учредитель: ${dot(f.founder)}` : 'Сведения подтверждены официальным сайтом организации.'] });
+  if (f.director) plan.push({ kind: 'bullets', title: 'Руководство', bullets: [`Директор: ${f.director}.`] });
+  if (f.founder && !f.founded) plan.push({ kind: 'bullets', title: 'Учредитель', bullets: [dot(f.founder)] });
+  plan.push({
+    kind: 'bullets',
+    title: 'Где находится',
+    bullets: [
+      d.geo ? `Адрес: ${d.geo.place}.` : f.address ? `Адрес: ${f.address}.` : 'Адрес уточняется по карте.',
+      d.geo ? `Координаты: ${d.geo.lat.toFixed(6)}, ${d.geo.lon.toFixed(6)}.` : '',
+      'Точка на карте отправлена отдельным сообщением.'
+    ].filter(Boolean)
+  });
+  plan.push({ kind: 'final', title: 'Вывод', bullets: [`${d.title} — важный объект открытой информации.`, 'Сведения можно проверить в официальных источниках и на карте.'] });
+
+  while (plan.length < n) {
+    plan.splice(Math.max(3, plan.length - 1), 0, { kind: 'bullets', title: 'Подробности', bullets: [splitBullets(d.text || '', 6)[plan.length % Math.max(1, splitBullets(d.text || '', 6).length)] || 'Дополнительные сведения приведены в открытых источниках.'] });
+  }
+  return plan.slice(0, n);
+}
+
+async function makePptx(d, slideCount, parsed, design) {
   const pptx = new PptxGenJS();
   pptx.layout = 'LAYOUT_16x9';
   pptx.author = 'SchoolBot';
@@ -922,7 +1260,7 @@ async function makePptx(d, slideCount, parsed) {
   };
 
   const plan = buildSlidePlan(d, slideCount, parsed);
-  const theme = pickTheme(d.title);
+  const theme = pickTheme(d.title, design);
 
   for (const item of plan) {
     const slide = pptx.addSlide();
@@ -939,11 +1277,11 @@ async function makePptx(d, slideCount, parsed) {
     if (item.kind === 'title') {
       slide.addShape(pptx.ShapeType.roundRect, {
         x: 0.5, y: 0.5, w: '90%', h: 1.0,
-        fill: { color: theme.dark }, line: { color: theme.dark }, radius: 0.12
+        fill: { color: theme.titleBg }, line: { color: theme.titleBg }, radius: 0.12
       });
       slide.addText(item.title, {
         x: 0.65, y: 0.63, w: '85%', h: 0.75, align: 'center', valign: 'mid',
-        fontSize: 30, bold: true, color: 'FFFFFF', fontFace: 'Arial', margin: 0
+        fontSize: 30, bold: true, color: theme.titleText, fontFace: 'Arial', margin: 0
       });
       if (item.subtitle) slide.addText(item.subtitle, {
         x: 0, y: 4.35, w: '100%', h: 0.35, align: 'center', fontSize: 16, color: theme.dark
@@ -974,7 +1312,7 @@ async function makePptx(d, slideCount, parsed) {
       bullets.map((b, i) => ({ text: String(b).replace(/\s+/g, ' ').trim(), options: { bullet: { code: '2022' }, breakLine: i < bullets.length - 1 } })),
       {
         x: 0.7, y: bodyY, w: '86%', h: bodyH, valign: 'mid', align: 'center',
-        fontSize, color: '1F2937', fontFace: 'Arial', lineSpacingMultiple: 1.18,
+        fontSize, color: theme.body, fontFace: 'Arial', lineSpacingMultiple: 1.18,
         paraSpaceAfterPt: 12, margin: 0.08, fit: 'shrink'
       }
     );
@@ -1002,6 +1340,12 @@ const mainMenu = Markup.keyboard([
 
 const removeKb = Markup.removeKeyboard().reply_markup;
 
+const designKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback(DESIGNS.school.label, 'design:school')],
+  [Markup.button.callback(DESIGNS.modern.label, 'design:modern')],
+  [Markup.button.callback(DESIGNS.bright.label, 'design:bright')]
+]).reply_markup;
+
 const sessions = new Map();
 function getSession(id) {
   if (!sessions.has(id)) sessions.set(id, { step: 'menu', awaitingPres: false, name: '', note: '' });
@@ -1020,24 +1364,34 @@ async function handleTextRequest(ctx, s, raw) {
   const parsed = parseRequest(raw, 'text');
   await safeReply(ctx, 'Понял запрос. Ищу и сверяю по нескольким источникам (до 30 секунд)…');
 
-  let person = null;
+  let subject = null;
   try {
-    person = await withTimeout(collectPerson(raw, parsed), MAX_SEARCH_MS, 'search');
+    subject = await withTimeout(collectSubject(raw, parsed), MAX_SEARCH_MS, 'search');
   } catch (e) {
     console.error('search error', e.message);
   }
 
-  if (!person) {
-    await safeReply(ctx, 'Не смог понять, о ком речь. Напиши, пожалуйста, имя человека целиком, например: «Альберт Эйнштейн» или «Уинстон Черчилль».');
+  if (!subject) {
+    await safeReply(ctx, 'Не смог понять тему. Напиши, о чём нужно: имя публичной личности, школу, организацию или место. Например: «школа 35 в Раменском районе, где находится и кто директор».');
     return;
   }
 
-  const report = makeReport(person, raw, parsed);
-  s.name = person.title;
+  const report = makeReport(subject, raw, parsed);
+  s.name = subject.title;
   s.note = raw;
   s.step = 'menu';
   await safeReply(ctx, report);
-  await safeReply(ctx, `Источник: ${person.source}. Если нужно изменить доклад, напиши уточнение (например, «без войны», «8 класс», «где учился»).`, mainMenu);
+
+  if (subject.geo) {
+    try {
+      await ctx.replyWithLocation(subject.geo.lat, subject.geo.lon);
+      await safeReply(ctx, `📍 Точка на карте: ${subject.geo.place || subject.title}\nhttps://yandex.ru/maps/?pt=${subject.geo.lon},${subject.geo.lat}&z=16&l=map`);
+    } catch (e) {
+      console.error('map reply error', e.message);
+    }
+  }
+
+  await safeReply(ctx, `Источник: ${subject.source}. Можно уточнить запрос: «без войны», «8 класс», «где учился», «адрес», «кто директор».`, mainMenu);
 }
 
 async function handlePresRequest(ctx, s, raw) {
@@ -1048,9 +1402,21 @@ async function handlePresRequest(ctx, s, raw) {
     String(raw).match(/(?<!\d)(\d{1,2})\s*[.)]?\s*$/u);
   s.slideCount = nums ? Math.max(3, Math.min(16, Number(nums[1]))) : 0;
 
+  const designMatch = String(raw).match(/(?<![\dа-яёa-z])(школьн[а-яё]*|современ[а-яё]*|ярк[а-яё]*|классич[а-яё]*|син[а-яё]*|classic|modern|bright)(?![\dа-яёa-z])/iu);
+  if (designMatch) {
+    const m = designMatch[1].toLowerCase();
+    s.design = /современ|modern/.test(m) ? 'modern' : /ярк|bright/.test(m) ? 'bright' : 'school';
+  }
+
   if (!s.slideCount) {
     s.step = 'pres_slides';
     await safeReply(ctx, 'Сколько слайдов нужно? Напиши числом от 3 до 16 (например, 8).', removeKb);
+    return;
+  }
+
+  if (!s.design) {
+    s.step = 'pres_design';
+    await safeReply(ctx, `Слайдов: ${s.slideCount}. Выбери дизайн презентации:`, designKeyboard);
     return;
   }
 
@@ -1059,24 +1425,24 @@ async function handlePresRequest(ctx, s, raw) {
 
 async function generatePres(ctx, s, raw) {
   const parsed = s.storedParsed || parseRequest(raw || s.name || '', 'pres');
-  await safeReply(ctx, 'Готовлю красивую презентацию…');
+  await safeReply(ctx, `Готовлю презентацию (${DESIGN_LABELS[s.design] || 'авто'})…`);
 
-  let person = null;
+  let subject = null;
   try {
     const query = s.name || raw || '';
-    person = await withTimeout(collectPerson(query, parsed), MAX_SEARCH_MS, 'search');
+    subject = await withTimeout(collectSubject(query, parsed), MAX_SEARCH_MS, 'search');
   } catch (_) {}
 
-  if (!person) {
-    await safeReply(ctx, 'Не смог понять, о ком презентация. Напиши имя целиком.', mainMenu);
+  if (!subject) {
+    await safeReply(ctx, 'Не смог понять тему презентации. Напиши, о чём она: личность, школа, организация или место.', mainMenu);
     s.step = 'menu';
     return;
   }
 
   try {
-    const file = await makePptx(person, s.slideCount, parsed);
-    await ctx.replyWithDocument({ source: file, filename: `Презентация_${person.title.replace(/[^\wа-яА-ЯёЁ-]+/g, '_')}.pptx` });
-    await safeReply(ctx, `Готово! Слайдов: ${s.slideCount}. Оформление подобрано автоматически.`, mainMenu);
+    const file = await makePptx(subject, s.slideCount, parsed, s.design);
+    await ctx.replyWithDocument({ source: file, filename: `Презентация_${subject.title.replace(/[^\wа-яА-ЯёЁ-]+/g, '_')}.pptx` });
+    await safeReply(ctx, `Готово! Слайдов: ${s.slideCount}. Дизайн: ${DESIGN_LABELS[s.design] || 'авто'}.`, mainMenu);
   } catch (e) {
     console.error('pptx error', e);
     await safeReply(ctx, 'Не удалось собрать файл презентации. Попробуй ещё раз.', mainMenu);
@@ -1091,19 +1457,19 @@ bot.on('text', async (ctx, next) => {
 
   if (text === '/start') {
     s.step = 'menu';
-    await safeReply(ctx, `Привет! Я помогаю делать школьные доклады и презентации о публичных личностях. Версия ${BOT_VERSION}.\nВыбери кнопку или просто напиши, про кого нужно.`, mainMenu);
+    await safeReply(ctx, `Привет! Я помогаю с докладами и презентациями: могу рассказать о публичной личности, школе, организации или месте, найти адрес и показать точку на карте. Версия ${BOT_VERSION}.\nВыбери кнопку или просто напиши вопрос.`, mainMenu);
     return;
   }
 
   if (text === '📝 Готовый текст') {
     s.step = 'text_topic';
-    await safeReply(ctx, 'Напиши, про кого и что учесть. Например:\nУинстон Черчилль, 8 класс, без войны, где учился и на кого пошёл', removeKb);
+    await safeReply(ctx, 'Напиши тему и что учесть. Например:\nУинстон Черчилль, 8 класс, без войны, где учился\nили\nшкола 35 в Раменском районе, история, директор, адрес', removeKb);
     return;
   }
 
   if (text === '📊 Презентация') {
     s.step = 'pres_topic';
-    await safeReply(ctx, 'Напиши, про кого презентация и сколько слайдов. Например:\nУинстон Черчилль, 8 слайдов', removeKb);
+    await safeReply(ctx, 'Напиши тему презентации и сколько слайдов. Потом спрошу дизайн. Например:\nУинстон Черчилль, 8 слайдов\nшкола 35 в Раменском районе, 8 слайдов', removeKb);
     return;
   }
 
@@ -1119,7 +1485,29 @@ bot.on('text', async (ctx, next) => {
   }
 
   if (s.step === 'pres_slides') {
-    await generatePres(ctx, s, text);
+    const nums = String(text).match(/(?<!\d)(\d{1,2})\s*(?:слайд|слайдов|слайда|лист|листов)(?![\dа-яёa-z])/iu) ||
+      String(text).match(/(?<!\d)(\d{1,2})\s*[.)]?\s*$/u);
+    const count = nums ? Number(nums[1]) : 0;
+    if (count < 3 || count > 16) {
+      await safeReply(ctx, 'Нужно число от 3 до 16. Например: 8.', removeKb);
+      return;
+    }
+    s.slideCount = count;
+    s.step = 'pres_design';
+    await safeReply(ctx, `Слайдов: ${count}. Выбери дизайн презентации:`, designKeyboard);
+    return;
+  }
+
+  if (s.step === 'pres_design') {
+    const m = norm(text);
+    if (/современ|modern/.test(m)) s.design = 'modern';
+    else if (/ярк|bright|оранж/.test(m)) s.design = 'bright';
+    else if (/школьн|classic|классич|син/.test(m)) s.design = 'school';
+    else {
+      await safeReply(ctx, 'Выбери дизайн кнопкой или напиши: школьный / современный / яркий.', designKeyboard);
+      return;
+    }
+    await generatePres(ctx, s, s.name || text);
     return;
   }
 
@@ -1132,7 +1520,25 @@ bot.on('text', async (ctx, next) => {
   }
 });
 
-bot.on('document', ctx => ctx.reply('Пришли, пожалуйста, текстом имя человека, про которого нужен доклад.'));
+bot.on('callback_query', async ctx => {
+  const data = String(ctx.callbackQuery && ctx.callbackQuery.data || '');
+  if (!data.startsWith('design:')) {
+    try { await ctx.answerCbQuery(); } catch (_) {}
+    return;
+  }
+  const key = data.slice('design:'.length);
+  if (!DESIGNS[key]) {
+    try { await ctx.answerCbQuery('Неизвестный дизайн'); } catch (_) {}
+    return;
+  }
+  const s = getSession(ctx.from.id);
+  s.design = key;
+  try { await ctx.answerCbQuery(`Дизайн: ${DESIGN_LABELS[key]}`); } catch (_) {}
+  try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch (_) {}
+  await generatePres(ctx, s, s.name || '');
+});
+
+bot.on('document', ctx => ctx.reply('Пришли текстом тему: личность, школа, организация или место. Пример: «школа 35 в Раменском районе».'));
 
 // ============================ START ============================
 
@@ -1166,6 +1572,8 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseRequest, cleanNameQuery, findLocal, collectPerson,
-  makeReport, makePptx, buildSlidePlan, LOCAL_PEOPLE
+  parseRequest, cleanNameQuery, findLocal, findLocalPlace,
+  collectPerson, collectSubject, makeReport, makePptx,
+  buildSlidePlan, LOCAL_PEOPLE, LOCAL_PLACES, DESIGNS,
+  extractTopic, geocodePlace
 };
