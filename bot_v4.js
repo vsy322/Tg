@@ -741,10 +741,16 @@ function deriveEntityFacts(title, text) {
 }
 
 function looksPerson(text, title) {
-  const t = `${title || ''} ${String(text || '').slice(0, 800)}`;
+  const name = String(title || '').trim();
+  // Online articles are treated as biographies only when their title looks
+  // like a full human name. Years/professions inside an article are not enough:
+  // e.g. "Чёрная дыра" mentions physicists and dates but is not a person.
+  const nameLike = /^[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)+$/.test(name);
+  if (!nameLike) return false;
+  const t = `${name} ${String(text || '').slice(0, 800)}`;
   const bad = /КБЖД|железная дорога|станция|поезд|маршрут|остановка|автобус| Уикипедия /i;
   if (bad.test(t)) return false;
-  const born = /родился|родилась|birth|born|\b18\d\d\b|\b19\d\d\b|\b20\d\d\b/i.test(t);
+  const born = /родился|родилась|birth|born/i.test(t);
   const human = /человек|политик|писатель|поэт|учён|учен|физик|химик|биолог|президент|премьер|корол|царь|князь|генерал|художник|композитор|актёр|актер|певец|космонавт|философ|математик|инженер|изобретатель|деятел|персон/i.test(t);
   return born || human;
 }
@@ -880,12 +886,14 @@ async function collectSubject(rawQuery, parsed) {
 
   if (!hit) return null;
 
+  const wantsPlace = !!(parsed && parsed.wantMap);
   let kind = 'topic';
-  if (looksPerson(hit.text, hit.title)) kind = 'person';
+  if (wantsPlace) kind = 'place';
+  else if (looksPerson(hit.text, hit.title)) kind = 'person';
   else if (looksPlace(topic)) kind = 'place';
   const facts = kind === 'person' ? deriveFacts(hit.title, hit.text) : deriveEntityFacts(hit.title, hit.text);
   let geo = null;
-  if ((kind === 'place' || parsed.wantMap || looksPlace(topic)) && Date.now() < deadline) {
+  if ((kind === 'place' || wantsPlace || looksPlace(topic)) && Date.now() < deadline) {
     geo = await withTimeout(geocodePlace(topic), Math.min(7000, msLeft()), 'map').catch(() => null);
   }
 
