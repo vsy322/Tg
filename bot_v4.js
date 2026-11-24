@@ -24,6 +24,13 @@ const WIKI_API = 'https://ru.wikipedia.org/w/api.php';
 const WIKI_FALLBACK = 'https://ru.m.wikipedia.org/w/api.php';
 const WIKI_EN_API = 'https://en.wikipedia.org/w/api.php';
 const WIKIMEDIA_API = 'https://api.wikimedia.org/core/v1/wikipedia/ru';
+const WD_PROPS = {
+  P31: 'Классификация', P279: 'Более широкий класс', P361: 'Часть объекта',
+  P571: 'Дата создания', P112: 'Основатель', P17: 'Страна', P159: 'Штаб-квартира',
+  P106: 'Деятельность', P569: 'Дата рождения', P570: 'Дата смерти',
+  P19: 'Место рождения', P27: 'Гражданство', P69: 'Образование',
+  P166: 'Награды', P176: 'Производитель'
+};
 const WIKIDATA_API = 'https://www.wikidata.org/w/api.php';
 const SPARQL_API = 'https://query.wikidata.org/sparql';
 const NOMINATIM_API = 'https://nominatim.openstreetmap.org/search';
@@ -730,6 +737,96 @@ async function wikimediaExtract(page) {
   };
 }
 
+// Wikidata lives on a different host and is not rate-limited together with
+// Wikipedia. It gives a compact structured answer when article APIs return 429.
+async function wikidataSearch(name) {
+  const data = await apiGet(WIKIDATA_API, {
+    action: 'wbsearchentities', search: name, language: 'ru', uselang: 'ru',
+    format: 'json', limit: 5, origin: '*'
+  });
+  return (data.search || []).map(x => ({
+    id: x.id,
+    title: x.label || (x.display && x.display.label && x.display.label.value) || name,
+    description: x.description || (x.display && x.display.description && x.display.description.value) || ''
+  }));
+}
+
+function wikidataClaimValue(claim) {
+  const dv = claim && claim.mainsnak && claim.mainsnak.datavalue;
+  if (!dv) return '';
+  const v = dv.value;
+  if (dv.type === 'wikibase-entityid') return `Q${v['numeric-id']}`;
+  if (dv.type === 'time') {
+    const m = String(v.time || '').match(/([+-]?\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return '';
+    return m[2] === '00' ? m[1] : m[3] === '00' ? `${m[1]}-${m[2]}` : `${m[1]}-${m[2]}-${m[3]}`;
+  }
+  if (dv.type === 'monolingualtext') return String(v.text || '');
+  if (dv.type === 'quantity') return String(v.amount || '').replace(/^\+/, '');
+  if (dv.type === 'globecoordinate') return `${v.latitude}, ${v.longitude}`;
+  return String(v || '');
+}
+
+async function wikidataLabels(ids) {
+  const out = {};
+  const list = [...new Set(ids)].filter(id => /^Q\d+$/.test(id)).slice(0, 30);
+  if (!list.length) return out;
+  try {
+    const data = await apiGet(WIKIDATA_API, {
+      action: 'wbgetentities', ids: list.join('|'), props: 'labels',
+      languages: 'ru|en', format: 'json', origin: '*'
+    });
+    for (const id of list) {
+      const ent = data.entities && data.entities[id];
+      const lab = ent && ent.labels && (ent.labels.ru || ent.labels.en);
+      out[id] = lab && lab.value || '';
+    }
+  } catch (_) {}
+  return out;
+}
+
+async function wikidataExtract(page) {
+  const data = await apiGet(WIKIDATA_API, {
+    action: 'wbgetentities', ids: page.id, props: 'labels|descriptions|aliases|claims',
+    languages: 'ru|en', format: 'json', origin: '*'
+  });
+  const ent = data.entities && data.entities[page.id];
+  if (!ent) return null;
+  const rawLabel = (ent.labels && ent.labels.ru || ent.labels && ent.labels.en || {}).value || page.title;
+  const label = rawLabel.charAt(0).toUpperCase() + rawLabel.slice(1);
+  const desc = (ent.descriptions && ent.descriptions.ru || ent.descriptions && ent.descriptions.en || {}).value || page.description || '';
+  const raw = {};
+  for (const prop of Object.keys(WD_PROPS)) {
+    const vals = [];
+    for (const claim of (ent.claims && ent.claims[prop] || [])) {
+      const v = wikidataClaimValue(claim);
+      if (v && !vals.includes(v)) vals.push(v);
+    }
+    if (vals.length) raw[prop] = vals;
+  }
+  const qids = Object.values(raw).flat();
+  const labels = await wikidataLabels(qids);
+  const parts = [];
+  if (desc) parts.push(`${label} — ${desc}.`);
+  const aliases = ((ent.aliases && ent.aliases.ru || []).map(a => a.value)
+    .filter(a => a.toLowerCase() !== label.toLowerCase())).slice(0, 3);
+  if (aliases.length) parts.push(`Другие названия: ${aliases.join(', ')}.`);
+  for (const [prop, propLabel] of Object.entries(WD_PROPS)) {
+    const vals = (raw[prop] || []).map(v => labels[v] || v).filter(Boolean).slice(0, 4);
+    if (!vals.length) continue;
+    if (prop === 'P569') parts.push(`${label} родился(ась) ${vals.join(', ')}.`);
+    else if (prop === 'P570') parts.push(`${label} умер(ла) ${vals.join(', ')}.`);
+    else parts.push(`${propLabel}: ${vals.join(', ')}.`);
+  }
+  return {
+    title: label,
+    text: parts.join(' '),
+    description: desc,
+    wikidata: page.id,
+    source: 'Wikidata'
+  };
+}
+
 async function wikidataLabel(qid) {
   if (!qid) return '';
   try {
@@ -908,8 +1005,10 @@ async function collectSubject(rawQuery, parsed) {
   let source = '';
   let lastWikiError = null;
 
-  for (const backend of ['wikimedia', 'wikipedia', 'wikipedia-mobile', 'wikipedia-en']) {
+  let wikiRateLimited = false;
+  for (const backend of ['wikimedia', 'wikidata', 'wikipedia', 'wikipedia-mobile', 'wikipedia-en']) {
     if (Date.now() > deadline) break;
+    if (wikiRateLimited && backend.startsWith('wikipedia')) continue;
     try {
       if (backend === 'wikimedia') {
         const pages = await withTimeout(wikimediaSearch(topic), Math.min(9000, msLeft()), 'wikimedia search');
@@ -920,6 +1019,17 @@ async function collectSubject(rawQuery, parsed) {
           if (extracted.text && extracted.text.length > 80) {
             hit = { ...extracted, source: 'Википедия' };
             source = 'Википедия';
+            break;
+          }
+        }
+      } else if (backend === 'wikidata') {
+        const pages = await withTimeout(wikidataSearch(topic), Math.min(9000, msLeft()), 'wikidata search');
+        for (const page of pages.slice(0, 3)) {
+          if (Date.now() > deadline) break;
+          const extracted = await withTimeout(wikidataExtract(page), Math.min(9000, msLeft()), 'wikidata extract');
+          if (extracted && extracted.text && extracted.text.length > 80) {
+            hit = extracted;
+            source = extracted.source;
             break;
           }
         }
@@ -940,6 +1050,7 @@ async function collectSubject(rawQuery, parsed) {
       }
     } catch (e) {
       lastWikiError = e;
+      if (backend === 'wikimedia' && e && e.response && e.response.status === 429) wikiRateLimited = true;
       console.error('wiki error', backend, e && e.message, e && e.response && e.response.status);
     }
     if (hit) break;
@@ -957,6 +1068,7 @@ async function collectSubject(rawQuery, parsed) {
     console.error('no subject hit', JSON.stringify({ topic, wikiError: lastWikiError && lastWikiError.message }));
     return null;
   }
+  console.log('subject found', JSON.stringify({ topic, title: hit.title, source }));
 
   const wantsPlace = !!(parsed && parsed.wantMap);
   let kind = 'topic';
@@ -1660,5 +1772,5 @@ module.exports = {
   parseRequest, cleanNameQuery, findLocal, findLocalPlace,
   collectPerson, collectSubject, makeReport, makePptx,
   buildSlidePlan, LOCAL_PEOPLE, LOCAL_PLACES, DESIGNS,
-  extractTopic, geocodePlace
+  extractTopic, geocodePlace, wikidataSearch, wikidataExtract
 };
